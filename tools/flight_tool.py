@@ -287,37 +287,72 @@ def resolve_location_to_iata(location: str):
 
 
 
+# Words that mark the location following them as an origin or a destination.
+ORIGIN_MARKERS = ("from", "departing", "leaving", "starting", "origin")
+DEST_MARKERS = ("to", "in", "at", "for", "visit", "visiting", "into", "towards")
+
+
+def build_location_candidates():
+    """
+    All searchable location names, longest first so that "south korea"
+    is matched before "korea".
+    """
+    names = set(COUNTRY_ALIASES) | set(CITY_MAIN_AIRPORT)
+
+    for country in pycountry.countries:
+        name = country.name.lower()
+        if len(name) >= 4:
+            names.add(name)
+
+    return sorted(names, key=len, reverse=True)
+
+
+LOCATION_CANDIDATES = build_location_candidates()
+
+
 def find_location_mentions(query: str):
     """
-    Finds country or city names inside a natural language query.
+    Finds country/city names inside a natural language query.
+
+    Returns them in the order they appear, each tagged with the role implied
+    by the word in front of it ("from Dhaka" -> origin, "to Tokyo" -> destination).
+
+    Each item is {"text": str, "start": int, "role": "origin"|"destination"|None}.
     """
 
     q = query.lower()
+    matches = []
+
+    for name in LOCATION_CANDIDATES:
+        for match in re.finditer(rf"\b{re.escape(name)}\b", q):
+            matches.append((match.start(), match.end(), name))
+
+    # Longest match wins wherever two names overlap ("south korea" beats "korea")
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+
+    kept = []
+    for start, end, name in matches:
+        overlaps = any(start < kept_end and end > kept_start
+                       for kept_start, kept_end, _ in kept)
+        if not overlaps:
+            kept.append((start, end, name))
+
+    kept.sort()
+
     mentions = []
+    for start, end, name in kept:
+        words_before = q[:start].split()
+        previous_word = words_before[-1] if words_before else ""
 
-    # Country aliases
-    for alias in COUNTRY_ALIASES:
-        if re.search(rf"\b{re.escape(alias)}\b", q):
-            mentions.append(alias)
+        role = None
+        if previous_word in ORIGIN_MARKERS:
+            role = "origin"
+        elif previous_word in DEST_MARKERS:
+            role = "destination"
 
-    # Country names from pycountry
-    for country in pycountry.countries:
-        name = country.name.lower()
-        if len(name) >= 4 and re.search(rf"\b{re.escape(name)}\b", q):
-            mentions.append(name)
+        mentions.append({"text": name, "start": start, "role": role})
 
-    # City names from our preferred city map
-    for city in CITY_MAIN_AIRPORT:
-        if re.search(rf"\b{re.escape(city)}\b", q):
-            mentions.append(city)
-
-    # Remove duplicate while keeping order
-    unique_mentions = []
-    for item in mentions:
-        if item not in unique_mentions:
-            unique_mentions.append(item)
-
-    return unique_mentions
+    return mentions
 
 
 def parse_route(query: str):
@@ -350,73 +385,48 @@ def parse_route(query: str):
     if any(keyword in q_lower for keyword in global_keywords):
         return None, None
 
-    # Direct IATA code route: DAC to NRT
-    codes = re.findall(r"\b[A-Z]{3}\b", q)
+    # Direct IATA code route: "DAC to NRT". Only trust codes that are real airports,
+    # so words like "USA" are not mistaken for one.
+    codes = [
+        code.upper()
+        for code in re.findall(r"\b[A-Z]{3}\b", q)
+        if code.upper() in AIRPORTS
+    ]
 
     if len(codes) >= 2:
-        dep = codes[0].upper()
-        arr = codes[1].upper()
-        return dep, arr
+        return codes[0], codes[1]
 
-    # Pattern: from X to Y
-    match = re.search(
-        r"\bfrom\s+(.+?)\s+\bto\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?]|$)",
-        q_lower,
-    )
-
-    if match:
-        origin_text = match.group(1)
-        dest_text = match.group(2)
-
-        dep_iata = resolve_location_to_iata(origin_text)
-        arr_iata = resolve_location_to_iata(dest_text)
-
-        return dep_iata, arr_iata
-
-    # Pattern: to Y from X
-    match = re.search(
-        r"\bto\s+(.+?)\s+\bfrom\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?]|$)",
-        q_lower,
-    )
-
-    if match:
-        dest_text = match.group(1)
-        origin_text = match.group(2)
-
-        dep_iata = resolve_location_to_iata(origin_text)
-        arr_iata = resolve_location_to_iata(dest_text)
-
-        return dep_iata, arr_iata
-
-    # Pattern: flights from X
-    match = re.search(r"\bfrom\s+(.+?)(?:[.!?]|$)", q_lower)
-
-    if match:
-        origin_text = match.group(1)
-        dep_iata = resolve_location_to_iata(origin_text)
-        return dep_iata, None
-
-    # Pattern: flights to X
-    match = re.search(r"\bto\s+(.+?)(?:[.!?]|$)", q_lower)
-
-    if match:
-        dest_text = match.group(1)
-        arr_iata = resolve_location_to_iata(dest_text)
-        return None, arr_iata
-
-    # Fallback: find country/city mentions
     mentions = find_location_mentions(q)
 
-    if len(mentions) >= 2:
-        dep_iata = resolve_location_to_iata(mentions[0])
-        arr_iata = resolve_location_to_iata(mentions[1])
-        return dep_iata, arr_iata
+    origin_text = next(
+        (m["text"] for m in mentions if m["role"] == "origin"), None
+    )
+    dest_text = next(
+        (m["text"] for m in mentions if m["role"] == "destination"), None
+    )
 
-    if len(mentions) == 1:
-        arr_iata = resolve_location_to_iata(mentions[0])
-        return DEFAULT_ORIGIN_IATA, arr_iata
+    # Locations with no "from"/"to" in front of them, in the order they appear
+    unmarked = [m["text"] for m in mentions if m["role"] is None]
 
-    return None, None
+    # "Plan a Japan trip from Bangladesh" -> Japan is the unmarked destination
+    if not dest_text and unmarked:
+        dest_text = unmarked.pop(0)
+
+    if not origin_text and unmarked:
+        origin_text = unmarked.pop(0)
+
+    dep_iata = resolve_location_to_iata(origin_text) if origin_text else None
+    arr_iata = resolve_location_to_iata(dest_text) if dest_text else None
+
+    # A destination with no stated origin departs from the configured home airport
+    if arr_iata and not dep_iata:
+        dep_iata = resolve_location_to_iata(DEFAULT_ORIGIN_IATA)
+
+    # A route that starts and ends at the same airport is not a route
+    if dep_iata and dep_iata == arr_iata:
+        arr_iata = None
+
+    return dep_iata, arr_iata
 
 
 def format_flight(flight: dict):
@@ -466,6 +476,47 @@ Arrival:
 """.strip()
 
 
+def request_flights(params: dict):
+    """
+    Calls the AviationStack API.
+    Returns (flight_list, error_message). Exactly one of the two is meaningful.
+    """
+
+    try:
+        response = requests.get(BASE_URL, params=params, timeout=30)
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        return None, f"Flight API request failed: {e}"
+    except ValueError:
+        return None, "Flight API returned invalid JSON."
+
+    if "error" in data:
+        error = data["error"]
+        return None, (
+            "Flight API error:\n"
+            f"Code: {error.get('code', 'Unknown')}\n"
+            f"Message: {error.get('message', 'Unknown error')}"
+        )
+
+    return data.get("data", []) or [], None
+
+
+def describe_route(dep_iata, arr_iata):
+    if dep_iata and arr_iata:
+        return f"Live flights from {dep_iata} to {arr_iata}"
+    if dep_iata:
+        return f"Live flights from {dep_iata}"
+    if arr_iata:
+        return f"Live flights to {arr_iata}"
+    return "Global live flights"
+
+
+PRICING_NOTE = (
+    "Note: AviationStack provides live flight schedules and status, not ticket prices. "
+    "For actual fare prices, use a flight-pricing API such as Amadeus."
+)
+
+
 def search_flights(query: str, limit: int = 10):
     if not API_KEY:
         return (
@@ -487,23 +538,33 @@ def search_flights(query: str, limit: int = 10):
     if arr_iata:
         params["arr_iata"] = arr_iata
 
-    try:
-        response = requests.get(BASE_URL, params=params, timeout=30)
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        return f"Flight API request failed: {e}"
-    except ValueError:
-        return "Flight API returned invalid JSON."
+    flight_data, error = request_flights(params)
 
-    if "error" in data:
-        error = data["error"]
-        return (
-            "Flight API error:\n"
-            f"Code: {error.get('code', 'Unknown')}\n"
-            f"Message: {error.get('message', 'Unknown error')}"
-        )
+    if error:
+        return error
 
-    flight_data = data.get("data", [])
+    header = describe_route(dep_iata, arr_iata)
+
+    # Many city pairs have no direct flight. Rather than returning nothing useful,
+    # fall back to departures from the origin and say clearly that is what happened.
+    if not flight_data and dep_iata and arr_iata:
+        fallback_params = {
+            "access_key": API_KEY,
+            "limit": min(limit, 100),
+            "dep_iata": dep_iata,
+        }
+
+        flight_data, error = request_flights(fallback_params)
+
+        if error:
+            return error
+
+        if flight_data:
+            header = (
+                f"No direct flights found from {dep_iata} to {arr_iata} "
+                f"in the live schedule, so a connecting itinerary is likely needed.\n"
+                f"Showing current departures from {dep_iata} instead"
+            )
 
     if not flight_data:
         route_text = ""
@@ -515,24 +576,15 @@ def search_flights(query: str, limit: int = 10):
         elif arr_iata:
             route_text = f" to {arr_iata}"
 
-        return (
-            f"No live flight data found{route_text}.\n\n"
-            "Note: AviationStack provides live/status flight data, not ticket prices. "
-            "For actual fare prices, use a flight-pricing API such as Amadeus."
-        )
-
-    route_info = "Global live flights"
-
-    if dep_iata and arr_iata:
-        route_info = f"Live flights from {dep_iata} to {arr_iata}"
-    elif dep_iata:
-        route_info = f"Live flights from {dep_iata}"
-    elif arr_iata:
-        route_info = f"Live flights to {arr_iata}"
+        return f"No live flight data found{route_text}.\n\n{PRICING_NOTE}"
 
     formatted_flights = [format_flight(flight) for flight in flight_data[:limit]]
 
-    return f"{route_info}\n\n" + "\n\n---\n\n".join(formatted_flights)
+    return (
+        f"{header}\n\n"
+        + "\n\n---\n\n".join(formatted_flights)
+        + f"\n\n{PRICING_NOTE}"
+    )
 
 
 if __name__ == "__main__":
